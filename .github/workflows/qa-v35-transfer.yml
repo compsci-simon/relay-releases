@@ -1,0 +1,118 @@
+name: Assemble QA v35 draft installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qa-v35-draft-installer-transfer
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      QA_TAG: v0.1.54-qa.35
+    steps:
+      - name: Check unpublished draft and download transfer parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api repos/$GH_REPO/releases/421956563 > "$RUNNER_TEMP/qa35-release-before.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          r=json.loads((Path(os.environ['RUNNER_TEMP'])/'qa35-release-before.json').read_text())
+          assert r['id']==421956563 and r['tag_name']=='v0.1.54-qa.35'
+          assert r['draft'] is True and r['prerelease'] is True and r['published_at'] is None
+          assert not any(a['name'].lower().endswith(('.yml','.yaml')) for a in r['assets'])
+          PY
+          mkdir "$RUNNER_TEMP/qa35-parts"
+          gh release download "$QA_TAG" --repo "$GH_REPO" --pattern '__qa35_transfer_*' --dir "$RUNNER_TEMP/qa35-parts"
+
+      - name: Verify every part and assemble exact installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          directory=Path(os.environ['RUNNER_TEMP'])/'qa35-parts'
+          m=json.loads((directory/'__qa35_transfer_manifest.json').read_text())
+          expected='b888961c612826ba8cb3510fd89e81acd6d45c3568a430930f1f54256d8aac71'
+          assert m['version']==1 and m['filename']=='Relay-Setup-0.1.54-qa.35.exe'
+          assert m['bytes']==698341775 and m['sha256']==expected and len(m['parts'])==42
+          assert {p.name for p in directory.iterdir()}=={'__qa35_transfer_manifest.json',*[p['name'] for p in m['parts']]}
+          output=Path(os.environ['RUNNER_TEMP'])/m['filename']
+          total=0
+          whole=hashlib.sha256()
+          with output.open('xb') as target:
+              for index, part in enumerate(m['parts']):
+                  assert part['name']==f'__qa35_transfer_part_{index:03d}.bin'
+                  assert re.fullmatch('[a-f0-9]{64}',part['sha256'])
+                  assert part['bytes']==(16777216 if index<41 else 10475919)
+                  file=directory/part['name']
+                  assert file.is_file() and not file.is_symlink() and file.stat().st_size==part['bytes']
+                  digest=hashlib.sha256()
+                  with file.open('rb') as source:
+                      while block:=source.read(1024*1024):
+                          digest.update(block); whole.update(block); target.write(block); total+=len(block)
+                  assert digest.hexdigest()==part['sha256'], part['name']
+          assert total==698341775 and whole.hexdigest()==expected
+          print('All 42 parts and complete installer match the original SHA256 and size.')
+          PY
+
+      - name: Upload binary to existing draft without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          repo=os.environ['GH_REPO']; tag=os.environ['QA_TAG']
+          r=json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/releases/421956563']))
+          assert r['draft'] is True and r['prerelease'] is True and r['published_at'] is None
+          name='Relay-Setup-0.1.54-qa.35.exe'
+          existing=[a for a in r['assets'] if a['name']==name]
+          if existing:
+              assert len(existing)==1 and existing[0]['state']=='uploaded'
+              assert existing[0]['size']==698341775 and existing[0]['digest']=='sha256:b888961c612826ba8cb3510fd89e81acd6d45c3568a430930f1f54256d8aac71'
+          else:
+              subprocess.run(['gh','release','upload',tag,str(Path(os.environ['RUNNER_TEMP'])/name),'--repo',repo],check=True)
+          PY
+
+      - name: Verify server copy and remove only verified transfer assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          repo=os.environ['GH_REPO']
+          api=lambda endpoint: json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/{endpoint}']))
+          r=api('releases/421956563'); latest=api('releases/latest')
+          assert r['draft'] is True and r['prerelease'] is True and r['published_at'] is None
+          assert latest['id']!=r['id'] and latest['tag_name']=='v0.1.53'
+          assets={a['name']:a for a in r['assets']}
+          binary=assets['Relay-Setup-0.1.54-qa.35.exe']
+          assert binary['state']=='uploaded' and binary['size']==698341775
+          assert binary['digest']=='sha256:b888961c612826ba8cb3510fd89e81acd6d45c3568a430930f1f54256d8aac71'
+          directory=Path(os.environ['RUNNER_TEMP'])/'qa35-parts'
+          manifest=directory/'__qa35_transfer_manifest.json'
+          m=json.loads(manifest.read_text())
+          owned=m['parts']+[{'name':manifest.name,'bytes':manifest.stat().st_size,'sha256':hashlib.sha256(manifest.read_bytes()).hexdigest()}]
+          for part in owned:
+              a=assets[part['name']]
+              assert a['state']=='uploaded' and a['size']==part['bytes'] and a['digest']=='sha256:'+part['sha256']
+          for part in owned:
+              subprocess.run(['gh','api','--method','DELETE',f"repos/{repo}/releases/assets/{assets[part['name']]['id']}"],check=True)
+          final=api('releases/421956563')
+          assert final['draft'] is True and final['prerelease'] is True and final['published_at'] is None
+          assert {a['name'] for a in final['assets']}=={'Relay-Setup-0.1.54-qa.35.exe','Relay-Setup-0.1.54-qa.35.exe.blockmap','SHA256SUMS.txt','build-provenance.json'}
+          print(json.dumps({'verified':True,'installerSha256':binary['digest'],'draft':True,'prerelease':True,'publishedAt':None,'latest':latest['tag_name'],'temporaryPartsRemoved':len(owned),'url':final['html_url']}))
+          PY
