@@ -76,6 +76,7 @@ jobs:
           from pathlib import Path
           repo=os.environ['GH_REPO']; tag=os.environ['QA_TAG']
           r=json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/releases/421956563']))
+          assert r['id']==421956563 and r['tag_name']=='v0.1.54-qa.35'
           assert r['draft'] is True and r['prerelease'] is True and r['published_at'] is None
           name='Relay-Setup-0.1.54-qa.35.exe'
           existing=[a for a in r['assets'] if a['name']==name]
@@ -112,7 +113,10 @@ jobs:
           for part in owned:
               subprocess.run(['gh','api','--method','DELETE',f"repos/{repo}/releases/assets/{assets[part['name']]['id']}"],check=True)
           final=api('releases/421956563')
+          latest=api('releases/latest')
+          assert final['id']==421956563 and final['tag_name']=='v0.1.54-qa.35'
           assert final['draft'] is True and final['prerelease'] is True and final['published_at'] is None
+          assert latest['id']!=final['id'] and latest['tag_name']=='v0.1.53'
           assert {a['name'] for a in final['assets']}=={'Relay-Setup-0.1.54-qa.35.exe','Relay-Setup-0.1.54-qa.35.exe.blockmap','SHA256SUMS.txt','build-provenance.json'}
           print(json.dumps({'verified':True,'installerSha256':binary['digest'],'draft':True,'prerelease':True,'publishedAt':None,'latest':latest['tag_name'],'temporaryPartsRemoved':len(owned),'url':final['html_url']}))
           PY
